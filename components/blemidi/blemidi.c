@@ -80,9 +80,6 @@ static uint8_t  blemidi_outbuffer[BLEMIDI_NUM_PORTS][GATTS_MIDI_CHAR_VAL_LEN_MAX
 static uint16_t blemidi_outbuffer_len[BLEMIDI_NUM_PORTS];
 static uint16_t blemidi_outbuffer_timestamp_last_flush = 0;
 
-// to handled continued SysEx
-static size_t   blemidi_continued_sysex_pos[BLEMIDI_NUM_PORTS];
-
 /* Attributes State Machine */
 enum
 {
@@ -187,15 +184,12 @@ static struct gatts_profile_inst midi_profile_tab[PROFILE_NUM] = {
 static const uint16_t primary_service_uuid         = ESP_GATT_UUID_PRI_SERVICE;
 static const uint16_t character_declaration_uuid   = ESP_GATT_UUID_CHAR_DECLARE;
 static const uint16_t character_client_config_uuid = ESP_GATT_UUID_CHAR_CLIENT_CONFIG;
-static const uint8_t char_prop_read                = ESP_GATT_CHAR_PROP_BIT_READ;
-static const uint8_t char_prop_write               = ESP_GATT_CHAR_PROP_BIT_WRITE;
-static const uint8_t char_prop_read_write_notify   = ESP_GATT_CHAR_PROP_BIT_WRITE | ESP_GATT_CHAR_PROP_BIT_READ | ESP_GATT_CHAR_PROP_BIT_NOTIFY;
 static const uint8_t char_prop_read_write_writenr_notify = ESP_GATT_CHAR_PROP_BIT_WRITE | ESP_GATT_CHAR_PROP_BIT_READ | ESP_GATT_CHAR_PROP_BIT_NOTIFY | ESP_GATT_CHAR_PROP_BIT_WRITE_NR;
 
 static const uint8_t char_value[3]                 = {0x80, 0x80, 0xfe};
 static const uint8_t blemidi_ccc[2]                = {0x00, 0x00};
 
-void (*blemidi_callback_midi_message_received)(uint8_t blemidi_port, uint16_t timestamp, uint8_t midi_status, uint8_t *remaining_message, size_t len, size_t continued_sysex_pos);
+void (*blemidi_callback_midi_message_received)(uint8_t *msg, size_t len);
 
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -343,117 +337,74 @@ int32_t blemidi_send_message(uint8_t blemidi_port, uint8_t *stream, size_t len)
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 static int32_t blemidi_receive_packet(uint8_t blemidi_port, uint8_t *stream, size_t len, void *_callback_midi_message_received)
 {
-  void (*callback_midi_message_received)(uint8_t blemidi_port, uint16_t timestamp, uint8_t midi_status, uint8_t *remaining_message, size_t len, size_t continued_sysex_pos) = _callback_midi_message_received;
+  void (*callback_midi_message_received)(uint8_t *msg, size_t len) = _callback_midi_message_received;
 
   if( blemidi_port >= BLEMIDI_NUM_PORTS )
     return -1; // invalid port
   
-  ESP_LOGI(BLEMIDI_TAG, "receive_packet blemidi_port=%d, len=%d, stream:", blemidi_port, len);
-  esp_log_buffer_hex(BLEMIDI_TAG, stream, len);
+  ESP_LOGI(BLEMIDI_TAG, "receive_packet len=%d", len);
 
-  // detect continued SysEx
-  uint8_t continued_sysex = 0;
-  if( len > 2 && (stream[0] & 0x80) && !(stream[1] & 0x80)) {
-    continued_sysex = 1;
-  } else {
-    blemidi_continued_sysex_pos[blemidi_port] = 0;
-  }
-  
-  
-  if( len < 3 ) {
-    ESP_LOGE(BLEMIDI_TAG, "stream length should be >=3");
-    return -1;
-  } else if( !(stream[0] & 0x80) ) {
-    ESP_LOGE(BLEMIDI_TAG, "missing timestampHigh");
-    return -2;
-  } else {
-    size_t pos = 0;
-    
-    // getting timestamp
-    uint16_t timestamp = (stream[pos++] & 0x3f) << 7;
+  // BLE messages are of the format:
+  // [header] [timestamp] [midi messages]
+  // optionally with [timestamp] prepending future midi messages in the stream
 
-    // parsing stream
-    {
-      //! Number if expected bytes for a common MIDI event - 1
-      const uint8_t midi_expected_bytes_common[8] = {
-        2, // Note On
-        2, // Note Off
-        2, // Poly Preasure
-        2, // Controller
-        1, // Program Change
-        1, // Channel Preasure
-        2, // Pitch Bender
-        0, // System Message - must be zero, so that mios32_midi_expected_bytes_system[] will be used
-      };
+  // when we hit a message with MSB set, that means it's either a header, timestamp or midi status byte
+  // if the next byte in the sequence does not have the MSB set, then we know this is a midi status byte
 
-      //! Number if expected bytes for a system MIDI event - 1
-      const uint8_t midi_expected_bytes_system[16] = {
-        1, // SysEx Begin (endless until SysEx End F7)
-        1, // MTC Data frame
-        2, // Song Position
-        1, // Song Select
-        0, // Reserved
-        0, // Reserved
-        0, // Request Tuning Calibration
-        0, // SysEx End
+  // build a buffer
+  // when we get a status byte, put it in the buffer
+  // when we get data, put it in the buffer
+  // the next time we get a MSB byte, ship the buffer, wipe it, and start over
 
-        // Note: just only for documentation, Realtime Messages don't change the running status
-        0, // MIDI Clock
-        0, // MIDI Tick
-        0, // MIDI Start
-        0, // MIDI Continue
-        0, // MIDI Stop
-        0, // Reserved
-        0, // Active Sense
-        0, // Reset
-      };
-      
-      uint8_t midi_status = continued_sysex ? 0xf0 : 0x00;
+  uint8_t midi_buffer[256] = {0};
+  uint8_t midi_buffer_index = 0;
 
-      while( pos < len ) {
-        if( !(stream[pos] & 0x80) ) {
-          if( !continued_sysex ) {
-            ESP_LOGE(BLEMIDI_TAG, "missing timestampLow in parsed message");
-            return -3;
-          }
-        } else {
-          timestamp &= ~0x7f;
-          timestamp |= stream[pos++] & 0x7f;
-          continued_sysex = 0;
-          blemidi_continued_sysex_pos[blemidi_port] = 0;
+  for (uint8_t i = 0; i < len; i++) {
+    uint8_t val = stream[i];
+    if (val & 0x80) {
+      // header, ts, or midi status byte
+      if (i != (len - 1)) {
+        uint8_t next_byte = stream[i + 1];
+        if (!(next_byte & 0x80)) {
+          // midi status byte
+          midi_buffer[midi_buffer_index] = val;
+          midi_buffer_index++;
         }
-        
-        if( stream[pos] & 0x80 ) {
-          midi_status = stream[pos++];
-        }
+        else {
+          // header or timestamp byte
+          if (midi_buffer[0] > 0) {
+            uint8_t *buf = malloc(midi_buffer_index * sizeof(uint8_t));
+            memcpy(buf, midi_buffer, midi_buffer_index * sizeof(uint8_t));
+            callback_midi_message_received(buf, midi_buffer_index);
+            free(buf);
 
-        if( midi_status == 0xf0 ) {
-          size_t num_bytes;
-          for(num_bytes=0; stream[pos+num_bytes] < 0x80; ++num_bytes) {
-            if( (pos+num_bytes) >= len ) {
-              break;
+            midi_buffer_index = 0;
+            for (uint8_t j = 0; j < 32; j++) {
+              midi_buffer[j] = 0;
             }
           }
-          if( _callback_midi_message_received ) {
-            callback_midi_message_received(blemidi_port, timestamp, midi_status, &stream[pos], num_bytes, blemidi_continued_sysex_pos[blemidi_port]);
-          }
-          pos += num_bytes;
-          blemidi_continued_sysex_pos[blemidi_port] += num_bytes; // we expect another packet with the remaining SysEx stream
-        } else {
-          uint8_t num_bytes = midi_expected_bytes_common[(midi_status >> 4) & 0x7];
-          if( num_bytes == 0 ) { // System Message
-            num_bytes = midi_expected_bytes_system[midi_status & 0xf];
-          }
+        }
+      }
+      else {
+        // MSB set on last byte in msg? should never happen
+      }
+    }
+    else {
+      // midi data byte
+      midi_buffer[midi_buffer_index] = val;
+      midi_buffer_index++;
+    }
 
-          if( (pos+num_bytes) > len ) {
-            ESP_LOGE(BLEMIDI_TAG, "missing %d bytes in parsed message", num_bytes);
-            return -5;
-          } else {
-            if( _callback_midi_message_received ) {
-              callback_midi_message_received(blemidi_port, timestamp, midi_status, &stream[pos], num_bytes, 0);
-            }
-            pos += num_bytes;
-          }
+    if (i == (len - 1)) {
+      if (midi_buffer[0] > 0) {
+        uint8_t *buf = malloc(midi_buffer_index * sizeof(uint8_t));
+        memcpy(buf, midi_buffer, midi_buffer_index * sizeof(uint8_t));
+        callback_midi_message_received(buf, midi_buffer_index);
+        free(buf);
+
+        midi_buffer_index = 0;
+        for (uint8_t j = 0; j < 32; j++) {
+          midi_buffer[j] = 0;
         }
       }
     }
@@ -461,17 +412,6 @@ static int32_t blemidi_receive_packet(uint8_t blemidi_port, uint8_t *stream, siz
   
   return 0; // no error
 }
-
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-// Dummy callback for demo and debugging purposes
-////////////////////////////////////////////////////////////////////////////////////////////////////
-void blemidi_receive_packet_callback_for_debugging(uint8_t blemidi_port, uint16_t timestamp, uint8_t midi_status, uint8_t *remaining_message, size_t len, size_t continued_sysex_pos)
-{
-  ESP_LOGI(BLEMIDI_TAG, "receive_packet CALLBACK blemidi_port=%d, timestamp=%d, midi_status=0x%02x, len=%d, continued_sysex_pos=%d, remaining_message:", blemidi_port, timestamp, midi_status, len, continued_sysex_pos);
-  esp_log_buffer_hex(BLEMIDI_TAG, remaining_message, len);
-}
-
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // From GATT Server Demo (customized for BLE MIDI service)
@@ -637,6 +577,7 @@ static void gatts_profile_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_
             ESP_LOGI(BLEMIDI_TAG, "ESP_GATTS_READ_EVT");
             break;
         case ESP_GATTS_WRITE_EVT:
+          ESP_LOGI(BLEMIDI_TAG, "ESP_GATTS_WRITE_EVT");
             if (!param->write.is_prep){
                 if (midi_handle_table[IDX_CHAR_VAL_A] == param->write.handle ) {
                   // the data length of gattc write  must be less than blemidi_mtu.
@@ -826,7 +767,6 @@ int32_t blemidi_init(void *_callback_midi_message_received)
     uint32_t blemidi_port;
     for(blemidi_port=0; blemidi_port<BLEMIDI_NUM_PORTS; ++blemidi_port) {
       blemidi_outbuffer_len[blemidi_port] = 0;
-      blemidi_continued_sysex_pos[blemidi_port] = 0;
     }
   }
   
@@ -837,54 +777,3 @@ int32_t blemidi_init(void *_callback_midi_message_received)
   
   return 0; // no error
 }
-
-
-#if BLEMIDI_ENABLE_CONSOLE
-////////////////////////////////////////////////////////////////////////////////////////////////////
-// Optional Console Commands
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-static struct {
-  struct arg_str *on_off;
-  struct arg_end *end;
-} blemidi_debug_args;
-
-static int cmd_blemidi_debug(int argc, char **argv)
-{
-  int nerrors = arg_parse(argc, argv, (void **)&blemidi_debug_args);
-  if( nerrors != 0 ) {
-      arg_print_errors(stderr, blemidi_debug_args.end, argv[0]);
-      return 1;
-  }
-
-  if( strcasecmp(blemidi_debug_args.on_off->sval[0], "on") == 0 ) {
-    printf("Enabled debug messages\n");
-    esp_log_level_set(BLEMIDI_TAG, ESP_LOG_INFO);
-  } else {
-    printf("Disabled debug messages - they can be re-enabled with 'ble_debug on'\n");
-    esp_log_level_set(BLEMIDI_TAG, ESP_LOG_WARN);
-  }
-
-  return 0; // no error
-}
-
-void blemidi_register_console_commands(void)
-{
-  {
-    blemidi_debug_args.on_off = arg_str1(NULL, NULL, "<on/off>", "Enables/Disables debug messages");
-    blemidi_debug_args.end = arg_end(20);
-
-    const esp_console_cmd_t blemidi_debug_cmd = {
-      .command = "blemidi_debug",
-      .help = "Enables/Disables BLEMIDI Debug Messages",
-      .hint = NULL,
-      .func = &cmd_blemidi_debug,
-      .argtable = &blemidi_debug_args
-    };
-
-    ESP_ERROR_CHECK( esp_console_cmd_register(&blemidi_debug_cmd) );
-  }
-}
-
-#endif
-

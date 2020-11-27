@@ -41,7 +41,7 @@ extern "C" {
 
 
 #ifndef BLEMIDI_DEVICE_NAME
-#define BLEMIDI_DEVICE_NAME "MIDIbox"
+#define BLEMIDI_DEVICE_NAME "ESP32_BLEMIDI"
 #endif  
 
 #ifndef BLEMIDI_TAG
@@ -92,22 +92,6 @@ extern int32_t blemidi_send_message(uint8_t blemidi_port, uint8_t *stream, size_
 extern int32_t blemidi_outbuffer_flush(uint8_t blemidi_port);
   
 /**
- * @brief A dummy callback which demonstrates the usage.
- *        It will just print out incoming MIDI messages on the terminal.
- *        You might want to implement your own for doing something more useful!
-
- * @param  blemidi_port currently always 0 expected (we might support multiple ports in future)
- * @param  timestamp    the timestamp
- * @param  midi_status  the MIDI status byte (first byte of a MIDI message)
- * @param  remaining_message the remaining bytes
- * @param  len          size of the remaining message
- * @param  continued_sysex_pos in case the next part of a SysEx stream has been received, this variable is >0 and passes the position of the continued sysex stream
- *
- * @return < 0 on errors
- */  
-extern void blemidi_receive_packet_callback_for_debugging(uint8_t blemidi_port, uint16_t timestamp, uint8_t midi_status, uint8_t *remaining_message, size_t len, size_t continued_sysex_pos);
-
-/**
  * @brief This function should be called each mS to update the timestamp and flush the output buffer
  *
  * @return < 0 on errors
@@ -127,15 +111,6 @@ extern uint8_t blemidi_timestamp_high(void);
  * @return < 0 on errors
  */  
 extern uint8_t blemidi_timestamp_low(void);
-
-#if BLEMIDI_ENABLE_CONSOLE
-/**
- * @brief Register Console Commands
- *
- * @return < 0 on errors
- */
-extern void blemidi_register_console_commands(void);
-#endif
 
 #ifdef __cplusplus
 }
